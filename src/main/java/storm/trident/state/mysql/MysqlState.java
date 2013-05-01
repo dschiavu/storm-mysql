@@ -8,6 +8,7 @@ import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 
@@ -62,39 +63,42 @@ public class MysqlState<T> implements IBackingMap<T> {
 	@Override
 	@SuppressWarnings({"unchecked","rawtypes"})
 	public List<T> multiGet(final List<List<Object>> keys) {
-		if (keys.isEmpty()) {
-			return new ArrayList<>();
-		}
-		// build a query using select key1, keys2, ..., val1, val2, ..., [txid], [prev_val1], ... FROM table WHERE (key1 = ? AND keys = ? ...) OR ...
-		final StringBuilder queryBuilder = new StringBuilder().append("SELECT ")
-			.append(buildColumns())
-			.append(" FROM ")
-			.append(config.getTable())
-			.append(" WHERE ")
-			.append(buildKeyQuery(keys.size()));
-		final Map<List<Object>, List<Object>> queryResults = query(queryBuilder.toString(), keys);
-		// build the value list by ordering based on the input keys and looking up the query results, transform to transactional and opaque values as needed
-		return Lists.transform(keys, new Function<List<Object>, T>() {
-			@Override
-			public T apply(final List<Object> key) {
-				final List<Object> values = queryResults.get(key);
-				if (values == null) {
-					return null;
-				} else {
-					switch (config.getType()) {
-					case OPAQUE: // partition the values list into 3 values [current], [txid], [prev]
-						return (T) new OpaqueValue((Long) values.get(config.getValueColumns().length), // txid
-							values.subList(0, config.getValueColumns().length), // curr values
-							values.subList(config.getValueColumns().length, values.size())); // prev values
-					case TRANSACTIONAL:
-						return (T) new TransactionalValue((Long) values.get(config.getValueColumns().length), // txid
-							values.subList(0, config.getValueColumns().length)); // curr values
-					default:
-						return (T) values;
+		final List<List<List<Object>>> partitionedKeys = Lists.partition(keys, config.getBatchSize());
+		final List<T> result = new ArrayList<>();
+		for (final List<List<Object>> pkeys : partitionedKeys) {
+			// build a query using select key1, keys2, ..., val1, val2, ..., [txid], [prev_val1], ... FROM table WHERE (key1 = ? AND keys = ? ...) OR ...
+			final StringBuilder queryBuilder = new StringBuilder().append("SELECT ")
+				.append(buildColumns())
+				.append(" FROM ")
+				.append(config.getTable())
+				.append(" WHERE ")
+				.append(buildKeyQuery(pkeys.size()));
+			final Map<List<Object>, List<Object>> queryResults = query(queryBuilder.toString(), pkeys);
+			// build the value list by ordering based on the input keys and looking up the query results, transform to transactional and opaque values as needed
+			result.addAll(Lists.transform(pkeys, new Function<List<Object>, T>() {
+				@Override
+				public T apply(final List<Object> key) {
+					final List<Object> values = queryResults.get(key);
+					if (values == null) {
+						return null;
+					} else {
+						switch (config.getType()) {
+						case OPAQUE: // partition the values list into 3 values [current], [txid], [prev]
+							return (T) new OpaqueValue((Long) values.get(config.getValueColumns().length), // txid
+								values.subList(0, config.getValueColumns().length), // curr values
+								values.subList(config.getValueColumns().length, values.size())); // prev values
+						case TRANSACTIONAL:
+							return (T) new TransactionalValue((Long) values.get(config.getValueColumns().length), // txid
+								values.subList(0, config.getValueColumns().length)); // curr values
+						default:
+							return (T) values;
+						}
 					}
 				}
-			}
-		});
+			}));
+			logger.debug(String.format("%1$d keys retrieved", pkeys.size()));
+		}
+		return result;
 	}
 
 	/**
@@ -103,55 +107,62 @@ public class MysqlState<T> implements IBackingMap<T> {
 	 */
 	@Override
 	public void multiPut(final List<List<Object>> keys, final List<T> values) {
-		// build a query insert into table(key1, key2, ..., value1, value2, ... , [txid], [prev_val1], ...) values (?,?,...), ... ON DUPLICATE KEY UPDATE value1 = VALUES(value1), ...
-		// how many params per row of data
-		// opaque => keys + 2 * vals + 1
-		// transactional => keys + vals + 1
-		// non-transactional => keys + vals
-		int paramCount = 0;
-		switch (config.getType()) {
-		case OPAQUE:
-			paramCount += config.getValueColumns().length;
-		case TRANSACTIONAL:
-			paramCount += 1;
-		default:
-			paramCount += (config.getKeyColumns().length + config.getValueColumns().length);
-		}
-		final StringBuilder queryBuilder = new StringBuilder().append("INSERT INTO ")
-			.append(config.getTable())
-			.append("(")
-			.append(buildColumns())
-			.append(") VALUES ")
-			.append(Joiner.on(",").join(repeat("(" + Joiner.on(",").join(repeat("?", paramCount)) + ")", keys.size())))
-			.append(" ON DUPLICATE KEY UPDATE ")
-			.append(Joiner.on(",").join(Lists.transform(getValueColumns(), new Function<String, String>() {
-				@Override
-				public String apply(final String col) {
-					return col + " = VALUES(" + col + ")";
-				}
-			}))); // for every value column, constructs "valcol = VALUE(valcol)", joined by commas
-		// run the update
-		final List<Object> params = flattenPutParams(keys, values);
-		PreparedStatement ps = null;
-		int i = 0;
-		try {
-			ps = connection.prepareStatement(queryBuilder.toString());
-			for (final Object param : params) {
-				ps.setObject(++i, param);
+		// partitions the keys and the values and run it over every one
+		final Iterator<List<List<Object>>> partitionedKeys = Lists.partition(keys, config.getBatchSize()).iterator();
+		final Iterator<List<T>> partitionedValues = Lists.partition(values, config.getBatchSize()).iterator();
+		while (partitionedKeys.hasNext() && partitionedValues.hasNext()) {
+			final List<List<Object>> pkeys = partitionedKeys.next();
+			final List<T> pvalues = partitionedValues.next();
+			// build a query insert into table(key1, key2, ..., value1, value2, ... , [txid], [prev_val1], ...) values (?,?,...), ... ON DUPLICATE KEY UPDATE value1 = VALUES(value1), ...
+			// how many params per row of data
+			// opaque => keys + 2 * vals + 1
+			// transactional => keys + vals + 1
+			// non-transactional => keys + vals
+			int paramCount = 0;
+			switch (config.getType()) {
+			case OPAQUE:
+				paramCount += config.getValueColumns().length;
+			case TRANSACTIONAL:
+				paramCount += 1;
+			default:
+				paramCount += (config.getKeyColumns().length + config.getValueColumns().length);
 			}
-			ps.execute();
-		} catch (final SQLException ex) {
-			logger.error("Multiput update failed", ex);
-		} finally {
-			if (ps != null) {
-				try {
-					ps.close();
-				} catch (SQLException ex) {
-					// don't care
+			final StringBuilder queryBuilder = new StringBuilder().append("INSERT INTO ")
+				.append(config.getTable())
+				.append("(")
+				.append(buildColumns())
+				.append(") VALUES ")
+				.append(Joiner.on(",").join(repeat("(" + Joiner.on(",").join(repeat("?", paramCount)) + ")", pkeys.size())))
+				.append(" ON DUPLICATE KEY UPDATE ")
+				.append(Joiner.on(",").join(Lists.transform(getValueColumns(), new Function<String, String>() {
+					@Override
+					public String apply(final String col) {
+						return col + " = VALUES(" + col + ")";
+					}
+				}))); // for every value column, constructs "valcol = VALUE(valcol)", joined by commas
+			// run the update
+			final List<Object> params = flattenPutParams(pkeys, pvalues);
+			PreparedStatement ps = null;
+			int i = 0;
+			try {
+				ps = connection.prepareStatement(queryBuilder.toString());
+				for (final Object param : params) {
+					ps.setObject(++i, param);
+				}
+				ps.execute();
+			} catch (final SQLException ex) {
+				logger.error("Multiput update failed", ex);
+			} finally {
+				if (ps != null) {
+					try {
+						ps.close();
+					} catch (SQLException ex) {
+						// don't care
+					}
 				}
 			}
+			logger.debug(String.format("%1$d keys flushed", pkeys.size()));
 		}
-		logger.debug(String.format("%1$d keys flushed", keys.size()));
 	}
 
 	private String buildColumns() {

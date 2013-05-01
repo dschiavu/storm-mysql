@@ -65,12 +65,20 @@ public class MysqlStateTopology {
 	}
 
 	@SuppressWarnings("serial")
-	static class LoggingFilter extends BaseFilter {
+	static class ThroughputLoggingFilter extends BaseFilter {
 
-		private static final Logger logger = Logger.getLogger(LoggingFilter.class);
+		private static final Logger logger = Logger.getLogger(ThroughputLoggingFilter.class);
+		private long count = 0;
+		private Long start = System.nanoTime();
+		private Long last = System.nanoTime();
 
 		public boolean isKeep(final TridentTuple tuple) {
-			logger.info(tuple);
+			count += 1;
+			final long now = System.nanoTime();
+			if (now - last > 5000000000L) { // emit every 5 seconds
+				logger.info("tuples per second = " + (count * 1000000000L) / (now - start));
+				last = now;
+			}
 			return true;
 		}
 	}
@@ -101,9 +109,9 @@ public class MysqlStateTopology {
 	 * @param args
 	 */
 	public static void main(final String[] args) {
-		final String dburl = "jdbc:mysql://mysql1:3306/storm_test?user=???&password=???";
+		final String dburl = "jdbc:mysql://mysql1:3306/storm_test?user=pmp&password=pmp";
 		final TridentTopology topology = new TridentTopology();
-		final GroupedStream stream = topology.newStream("test", new RandomTupleSpout()).groupBy(new Fields("a"));
+		final GroupedStream stream = topology.newStream("test", new RandomTupleSpout()).each(new Fields(), new ThroughputLoggingFilter()).groupBy(new Fields("a"));
 		final MysqlStateConfig config = new MysqlStateConfig();
 		{
 			config.setUrl(dburl);
